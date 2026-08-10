@@ -1,4 +1,5 @@
 import asyncio
+import ast
 import base64
 import binascii
 import io
@@ -97,22 +98,96 @@ WEBHOOK_RE = re.compile(
     r"https?://(?:canary\.|ptb\.)?(?:discord(?:app)?\.com)/api/webhooks/\d{5,}/[A-Za-z0-9._-]+",
     re.IGNORECASE,
 )
-WEBHOOK_FRAGMENT_RE = re.compile(r"(?:discord(?:app)?\.com|discord\.gg).{0,80}(?:api|webhook)", re.IGNORECASE)
-URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
+WEBHOOK_PATH_RE = re.compile(
+    r"(?:discord(?:app)?\.com|discord\.gg)[^\s\"'<>]{0,120}(?:api|webhooks?)",
+    re.IGNORECASE,
+)
 LUA_STRING_RE = re.compile(r"""(['"])(.*?)(?<!\\)\1""", re.DOTALL)
-BASE64_RE = re.compile(r"(?<![A-Za-z0-9+/])([A-Za-z0-9+/]{20,}={0,2})(?![A-Za-z0-9+/])")
+LUA_LONG_STRING_RE = re.compile(r"\[\[(.*?)\]\]", re.DOTALL)
+BASE64_RE = re.compile(r"(?<![A-Za-z0-9+/_-])([A-Za-z0-9+/_-]{20,}={0,2})(?![A-Za-z0-9+/_-])")
 HEX_RE = re.compile(r"(?<![0-9A-Fa-f])([0-9A-Fa-f]{24,})(?![0-9A-Fa-f])")
 DECIMAL_ESCAPE_RE = re.compile(r"\\([0-9]{1,3})")
 HEX_ESCAPE_RE = re.compile(r"\\x([0-9A-Fa-f]{2})")
+LUA_CHAR_CALL_RE = re.compile(
+    r"\b(?:string|utf8)\s*\.\s*char\s*\(([^()\n]{1,4000})\)",
+    re.IGNORECASE,
+)
+LUA_ASSIGNMENT_RE = re.compile(
+    r"(?:local\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([^;\n]+)",
+    re.IGNORECASE,
+)
+LUA_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+LUA_LITERAL_RE = re.compile(r"""^\s*(['"])(.*?)(?<!\\)\1\s*$""", re.DOTALL)
+LUA_LONG_LITERAL_RE = re.compile(r"^\s*\[\[(.*?)\]\]\s*$", re.DOTALL)
+LUA_REVERSE_RE = re.compile(r"\bstring\s*\.\s*reverse\s*\(([^)]{1,2000})\)", re.IGNORECASE)
+LUA_DYNAMIC_CODE_RE = re.compile(
+    r"\b(?:loadstring|loadfile|dofile|load)\s*\(|\bassert\s*\(\s*(?:load|string\.char|utf8\.char)",
+    re.IGNORECASE,
+)
+LUA_OBFUSCATION_RE = re.compile(
+    r"\b(?:string|utf8)\s*\.\s*char\b|\b(?:table\s*\.\s*concat|string\s*\.\s*reverse)\b"
+    r"|\b(?:bit32?|bit)\s*\.\s*(?:bxor|band|bor|lshift|rshift)\b",
+    re.IGNORECASE,
+)
 
 
 KEYLOGGER_RULES: tuple[tuple[str, str, str, str], ...] = (
-    ("high", "Keyboard API", r"\b(?:GetAsyncKeyState|GetKeyState|MapVirtualKey(?:A|W)?|RegisterRawInputDevices)\b", "Windows keyboard API"),
-    ("high", "Lua keyboard hook", r"\b(?:keyboard|keylogger|key[_-]?log|onKeyDown|on_key_down|isKeyDown|keyDown)\b", "keyboard hook/keylogger indicator"),
-    ("high", "Input capture", r"\b(?:io\.read|io\.lines|readfile|read_file|GetInput|InputBegan|UserInputService)\b", "input capture function"),
-    ("medium", "Clipboard access", r"\b(?:clipboard|GetClipboardData|setclipboard|toclipboard)\b", "clipboard access indicator"),
-    ("medium", "Data exfiltration", r"\b(?:HttpPost|HttpGet|PerformHttpRequest|request\s*\(|http\.request|curl|wget)\b", "network request indicator"),
-    ("medium", "Process execution", r"\b(?:os\.execute|io\.popen|ShellExecute|CreateProcess)\b", "process execution indicator"),
+    (
+        "high",
+        "Keyboard API",
+        r"\b(?:GetAsyncKeyState|GetKeyState|MapVirtualKey(?:A|W)?|RegisterRawInputDevices|"
+        r"GetRawInputData|SetWindowsHookEx(?:A|W)?|WH_KEYBOARD_LL|keyboard\.is_pressed|pynput)\b",
+        "Windows or library keyboard API",
+    ),
+    (
+        "high",
+        "Lua keyboard hook",
+        r"\b(?:keyboard|keylogger|key[_-]?log|onKeyDown|on_key_down|onkeypress|"
+        r"isKeyDown|keyDown|KeyPressed|KeyboardInput|InputBegan)\b",
+        "keyboard hook/keylogger indicator",
+    ),
+    (
+        "high",
+        "Input capture",
+        r"\b(?:io\.read|io\.lines|readfile|read_file|GetInput|UserInputService|"
+        r"GetForegroundWindow|GetWindowText(?:A|W)?)\b",
+        "input capture or active-window indicator",
+    ),
+    (
+        "high",
+        "Clipboard access",
+        r"\b(?:clipboard|GetClipboardData|OpenClipboard|setclipboard|toclipboard|"
+        r"readclipboard|writeclipboard)\b",
+        "clipboard access indicator",
+    ),
+    (
+        "high",
+        "Screen capture",
+        r"\b(?:screenshot|screen[_-]?capture|BitBlt|PrintWindow|CaptureScreen|"
+        r"getScreenImage|takeScreenshot)\b",
+        "screen capture indicator",
+    ),
+    (
+        "medium",
+        "Data exfiltration",
+        r"\b(?:HttpPost|HttpGet|PerformHttpRequest|request\s*\(|http\.request|"
+        r"curl|wget|fetch\s*\(|webhook)\b",
+        "network request or webhook indicator",
+    ),
+    (
+        "medium",
+        "File/data storage",
+        r"\b(?:io\.open|writefile|appendfile|readfile|savefile|json\.encode|"
+        r"localStorage|sqlite|database)\b",
+        "local storage or data collection indicator",
+    ),
+    (
+        "high",
+        "Process execution",
+        r"\b(?:os\.execute|io\.popen|ShellExecute|CreateProcess|spawn\s*\(|"
+        r"subprocess|powershell|cmd\.exe)\b",
+        "process execution indicator",
+    ),
 )
 
 
@@ -128,6 +203,27 @@ def _unique(values: Iterable[str], limit: int = 5) -> list[str]:
 
 
 def decode_lua_escapes(value: str) -> str:
+    replacements = {
+        r"\n": "\n",
+        r"\r": "\r",
+        r"\t": "\t",
+        r"\b": "\b",
+        r"\f": "\f",
+        r"\v": "\v",
+        r"\a": "\a",
+        r"\0": "\0",
+        r"\\": "\\",
+        r"\"": '"',
+        r"\'": "'",
+    }
+
+    # Lua's \z escape removes following whitespace, which is often used to
+    # hide a URL across multiple source lines.
+    value = re.sub(r"\\z\s*", "", value)
+    for escaped, decoded in replacements.items():
+        value = value.replace(escaped, decoded)
+    value = value.replace(r"\/", "/")
+
     def decimal_replace(match: re.Match[str]) -> str:
         number = int(match.group(1))
         return chr(number) if number <= 255 else match.group(0)
@@ -143,7 +239,7 @@ def compact(value: str) -> str:
 def safe_base64_decode(value: str) -> str | None:
     try:
         padded = value + "=" * (-len(value) % 4)
-        decoded = base64.b64decode(padded, validate=True)
+        decoded = base64.urlsafe_b64decode(padded)
         if not decoded or len(decoded) > 200_000:
             return None
         text = decoded.decode("utf-8", errors="ignore")
@@ -152,29 +248,215 @@ def safe_base64_decode(value: str) -> str | None:
         return None
 
 
+def _split_top_level(value: str, separator: str = "..") -> list[str]:
+    parts: list[str] = []
+    start = 0
+    depth = 0
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")":
+            depth = max(0, depth - 1)
+        elif depth == 0 and value.startswith(separator, index):
+            parts.append(value[start:index])
+            index += len(separator)
+            start = index
+            continue
+        index += 1
+    parts.append(value[start:])
+    return parts
+
+
+def _safe_int_expression(expression: str) -> int | None:
+    """Evaluate only integer literals and basic arithmetic for string.char."""
+    expression = expression.strip().replace("^", "**")
+    expression = re.sub(r"(?i)0x([0-9a-f]+)", r"0x\1", expression)
+    if len(expression) > 80 or not re.fullmatch(r"[0-9A-Fa-fxX\s()+\-*/%|&<>*]+", expression):
+        return None
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError:
+        return None
+
+    def visit(node: ast.AST) -> int:
+        if isinstance(node, ast.Expression):
+            return visit(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, int):
+            return node.value
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub, ast.Invert)):
+            value = visit(node.operand)
+            return value if isinstance(node.op, ast.UAdd) else (-value if isinstance(node.op, ast.USub) else ~value)
+        if isinstance(node, ast.BinOp) and isinstance(
+            node.op,
+            (ast.Add, ast.Sub, ast.Mult, ast.FloorDiv, ast.Div, ast.Mod, ast.BitOr, ast.BitAnd, ast.BitXor, ast.LShift, ast.RShift),
+        ):
+            left = visit(node.left)
+            right = visit(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            if isinstance(node.op, (ast.FloorDiv, ast.Div)):
+                return left // right
+            if isinstance(node.op, ast.Mod):
+                return left % right
+            if isinstance(node.op, ast.BitOr):
+                return left | right
+            if isinstance(node.op, ast.BitAnd):
+                return left & right
+            if isinstance(node.op, ast.BitXor):
+                return left ^ right
+            if isinstance(node.op, ast.LShift):
+                return left << right
+            return left >> right
+        raise ValueError("unsupported expression")
+
+    try:
+        return visit(tree)
+    except (ValueError, ZeroDivisionError, OverflowError):
+        return None
+
+
+def decode_lua_char_calls(source: str) -> list[str]:
+    decoded_values: list[str] = []
+    for match in LUA_CHAR_CALL_RE.finditer(source):
+        values: list[str] = []
+        valid = True
+        for argument in _split_top_level(match.group(1), separator=","):
+            number = _safe_int_expression(argument)
+            if number is None or not 0 <= number <= 255:
+                valid = False
+                break
+            values.append(chr(number))
+        if valid and values:
+            decoded_values.append("".join(values))
+    return decoded_values
+
+
+def _literal_value(expression: str) -> str | None:
+    expression = expression.strip()
+    while expression.startswith("(") and expression.endswith(")"):
+        expression = expression[1:-1].strip()
+    match = LUA_LITERAL_RE.match(expression)
+    if match:
+        return decode_lua_escapes(match.group(2))
+    match = LUA_LONG_LITERAL_RE.match(expression)
+    return match.group(1) if match else None
+
+
+def extract_static_assignments(source: str) -> list[str]:
+    """Resolve simple local a = 'x' .. b chains without executing Lua."""
+    assignments = LUA_ASSIGNMENT_RE.findall(source)
+    known: dict[str, str] = {}
+    values: list[str] = []
+    for _ in range(6):
+        changed = False
+        for name, expression in assignments:
+            expression = re.sub(
+                r"\b(?:string|utf8)\s*\.\s*char\s*\(([^()\n]{1,4000})\)",
+                lambda match: repr("".join(
+                    chr(number)
+                    for argument in _split_top_level(match.group(1), separator=",")
+                    if (number := _safe_int_expression(argument)) is not None and 0 <= number <= 255
+                )),
+                expression,
+                flags=re.IGNORECASE,
+            )
+            parts = _split_top_level(expression)
+            resolved: list[str] = []
+            valid = True
+            for part in parts:
+                literal = _literal_value(part)
+                if literal is not None:
+                    resolved.append(literal)
+                elif LUA_IDENTIFIER_RE.fullmatch(part.strip()) and part.strip() in known:
+                    resolved.append(known[part.strip()])
+                else:
+                    valid = False
+                    break
+            if valid and resolved:
+                combined = "".join(resolved)
+                if known.get(name) != combined:
+                    known[name] = combined
+                    values.append(combined)
+                    changed = True
+        if not changed:
+            break
+    return values
+
+
 def build_search_material(source: str) -> list[str]:
-    material = [source, decode_lua_escapes(source), urllib.parse.unquote(source)]
-    strings = [decode_lua_escapes(match.group(2)) for match in LUA_STRING_RE.finditer(source)]
+    material: list[str] = [source, decode_lua_escapes(source), urllib.parse.unquote(source)]
+    material.extend(decode_lua_char_calls(source))
+    material.extend(extract_static_assignments(source))
+
+    strings = [
+        decode_lua_escapes(match.group(2))
+        for match in LUA_STRING_RE.finditer(source)
+    ]
+    strings.extend(match.group(1) for match in LUA_LONG_STRING_RE.finditer(source))
     material.extend(strings)
 
-    for match in BASE64_RE.finditer(source):
-        decoded = safe_base64_decode(match.group(1))
-        if decoded:
-            material.append(decoded)
+    for match in LUA_REVERSE_RE.finditer(source):
+        literal = _literal_value(match.group(1))
+        if literal:
+            material.append(literal[::-1])
 
-    for match in HEX_RE.finditer(source):
-        raw = match.group(1)
-        try:
-            decoded = bytes.fromhex(raw).decode("utf-8", errors="ignore")
-            if decoded:
-                material.append(decoded)
-        except ValueError:
-            continue
+    # Decode several layers, but keep the process bounded and never execute
+    # decoded Lua. This is safe for files uploaded by untrusted users.
+    for _ in range(3):
+        new_values: list[str] = []
+        for current in list(material):
+            decoded_url = urllib.parse.unquote(current)
+            if decoded_url != current:
+                new_values.append(decoded_url)
+            for match in BASE64_RE.finditer(current):
+                decoded = safe_base64_decode(match.group(1))
+                if decoded:
+                    new_values.append(decoded)
+            for match in HEX_RE.finditer(current):
+                raw = match.group(1)
+                try:
+                    decoded = bytes.fromhex(raw).decode("utf-8", errors="ignore")
+                except ValueError:
+                    decoded = ""
+                if decoded:
+                    new_values.append(decoded)
+        if not new_values:
+            break
+        material.extend(new_values)
 
-    # This catches webhook fragments assembled with Lua concatenation.
+    # Detect reversed fragments and strings assembled through concatenation.
+    material.extend(item[::-1] for item in list(material) if len(item) <= 200_000)
     material.append("".join(strings))
     material.append("".join(compact(item) for item in strings))
-    return material
+
+    unique: list[str] = []
+    seen: set[str] = set()
+    for item in material:
+        if item and item not in seen:
+            seen.add(item)
+            unique.append(item[:200_000])
+        if len(unique) >= 2500:
+            break
+    return unique
 
 
 def scan_lua(filename: str, source: str) -> ScanResult:
@@ -188,15 +470,15 @@ def scan_lua(filename: str, source: str) -> ScanResult:
         result.findings.append(
             Finding("webhook", "critical", "Discord webhook URL ditemukan", "; ".join(webhook_matches))
         )
-    elif WEBHOOK_FRAGMENT_RE.search(combined) or all(
-        token in compacted for token in ("discord", "api", "webhook")
+    elif WEBHOOK_PATH_RE.search(combined) or (
+        "discord" in compacted and "webhook" in compacted and "api" in compacted
     ):
         result.findings.append(
             Finding(
                 "webhook",
                 "high",
-                "Pola Discord webhook terdeteksi",
-                "URL/potongan URL terlihat setelah normalisasi atau decoding",
+                "Pola Discord webhook terdeteksi setelah normalisasi/decoding",
+                "Potongan URL atau komponen webhook ditemukan",
             )
         )
 
@@ -205,6 +487,25 @@ def scan_lua(filename: str, source: str) -> ScanResult:
         if re.search(pattern, combined, re.IGNORECASE) and title not in seen_rules:
             seen_rules.add(title)
             result.findings.append(Finding("keylogger", severity, title, evidence))
+
+    if LUA_DYNAMIC_CODE_RE.search(source):
+        result.findings.append(
+            Finding(
+                "obfuscation",
+                "critical",
+                "Eksekusi kode dinamis",
+                "load/loadstring/loadfile/dofile dapat menyembunyikan perilaku saat runtime",
+            )
+        )
+    elif LUA_OBFUSCATION_RE.search(source):
+        result.findings.append(
+            Finding(
+                "obfuscation",
+                "medium",
+                "Teknik obfuscation terdeteksi",
+                "string.char/table.concat/string.reverse/bitwise decoder ditemukan",
+            )
+        )
 
     # Escalate combinations commonly used to capture and send keystrokes.
     has_input = any(item.category == "keylogger" and item.title in {"Keyboard API", "Lua keyboard hook", "Input capture"} for item in result.findings)
